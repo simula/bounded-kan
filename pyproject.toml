@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bounded-kan"
+version = "0.1.0"
+description = "A physics-constrained Kolmogorov-Arnold Network with bounded latent spaces."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.9.0",
+]
