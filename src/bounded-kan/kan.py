@@ -1,6 +1,7 @@
+import math
+
 import torch
 import torch.nn.functional as F
-import math
 
 
 class KANLinear(torch.nn.Module):
@@ -12,7 +13,7 @@ class KANLinear(torch.nn.Module):
         spline_order=3,
         base_activation=torch.nn.Identity,
         grid_range=(-1.0, 1.0),
-        pure_spline_mode=False
+        pure_spline_mode=False,
     ):
         super(KANLinear, self).__init__()
         self.in_features = in_features
@@ -25,10 +26,7 @@ class KANLinear(torch.nn.Module):
         # Static grid formulation
         h = (grid_range[1] - grid_range[0]) / grid_size
         grid = (
-            (
-                torch.arange(-spline_order, grid_size + spline_order + 1) * h
-                + grid_range[0]
-            )
+            (torch.arange(-spline_order, grid_size + spline_order + 1) * h + grid_range[0])
             .expand(in_features, -1)
             .contiguous()
         )
@@ -56,8 +54,7 @@ class KANLinear(torch.nn.Module):
         torch.nn.init.zeros_(self.spline_weight)
 
     def b_splines(self, x: torch.Tensor):
-        """
-        Compute the B-spline bases for the given input tensor.
+        """Compute the B-spline bases for the given input tensor.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, in_features).
@@ -74,14 +71,8 @@ class KANLinear(torch.nn.Module):
         bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
         for k in range(1, self.spline_order + 1):
             bases = (
-                (x - grid[:, : -(k + 1)])
-                / (grid[:, k:-1] - grid[:, : -(k + 1)])
-                * bases[:, :, :-1]
-            ) + (
-                (grid[:, k + 1 :] - x)
-                / (grid[:, k + 1 :] - grid[:, 1:(-k)])
-                * bases[:, :, 1:]
-            )
+                (x - grid[:, : -(k + 1)]) / (grid[:, k:-1] - grid[:, : -(k + 1)]) * bases[:, :, :-1]
+            ) + ((grid[:, k + 1 :] - x) / (grid[:, k + 1 :] - grid[:, 1:(-k)]) * bases[:, :, 1:])
 
         assert bases.size() == (
             x.size(0),
@@ -127,8 +118,7 @@ class KANLinear(torch.nn.Module):
 
 
 class KAN(torch.nn.Module):
-    """
-    Kolmogorov-Arnold Network (KAN) macro-architecture composed of sequentially stacked KANLinear layers.
+    """Kolmogorov-Arnold Network (KAN) macro-architecture composed of sequentially stacked KANLinear layers.
 
     Coordinates deep layer propagation by chaining self-contained Bounded KAN blocks. If
     `pure_spline_mode` is False, the underlying layers maintain an internal scale-preserving
@@ -148,6 +138,7 @@ class KAN(torch.nn.Module):
             across all child layers, forcing hard saturation/clipping at boundaries instead
             of proportional linear extrapolation.
     """
+
     def __init__(
         self,
         layers_hidden,
