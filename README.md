@@ -37,6 +37,15 @@ To maintain the absolute physical meaning of these latent observables during dep
 ### 1. Static grid boundaries
 Original KAN architectures often rely on dynamic grid updates (knot insertion or movement) during training. Bounded-KAN strictly disables this. Dynamic updates fundamentally shift the underlying coordinate system of the network mid-training, causing downstream layers to lose their physical calibration. By enforcing a static grid, Bounded-KAN sacrifices some theoretical curve-fitting capacity to guarantee that a specific latent state retains its exact metric meaning from initialization to deployment.
 
+#### Inter-layer OOB preservation
+
+To guarantee that OOB retains its physical magnitude through deep layers, Bounded-KAN relies on a standard residual macro-architecture rather than dynamic normalization:
+
+**Global residual skip connections**
+Dynamic scaling (e.g., layer normalization) is disabled, as batch-dependent variance adjustments destroy both the absolute magnitude of physical metrics and the linear OOB safety valve. Instead, layers are wrapped in standard residual blocks ($y = x + \text{KAN}(x)$). 
+
+Standard L2 weight decay (via AdamW) gently pressures the KAN's internal linear weights toward zero. Consequently, during an extreme anomaly, the saturated KAN layer's contribution safely minimizes, allowing the global identity skip connection to act as a perfect 1-to-1 physical passthrough. This preserves the exact scale of OOB events across arbitrary depths without requiring custom loss functions, matrix hacking, or normalization layers.
+
 ### 2. Linear Skip connections as safety valves
 Because the spline gradients are deliberately detached for OOB values, the network routes the excess gradients entirely through the parallel linear skip connection. This serves as a vital safety valve: it protects the non-linear splines from extreme gradient pollution, and it ensures that OOB inputs extrapolate linearly and predictably. This strictly limits the "blast radius" of severe anomalies, making downstream system filtering significantly more reliable.
 
