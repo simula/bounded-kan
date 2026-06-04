@@ -138,7 +138,7 @@ prediction_extreme = model(x_extreme)
 This repository is an adaptation of the excellent
 **[efficient-kan](https://github.com/Blealtan/efficient-kan)** library by Blealtan. 
 
-The core B-spline evaluation mechanics, memory optimizations, and foundational
+The core B-spline evaluation mechanics, memory-efficient tensor formulation, and foundational
 matrix operations in `Bounded-KAN` are directly derived from `efficient-kan`.
 The modifications introduced here are strictly architectural (specifically the
 detached routing, strict boundary clamping, and default identity activations) 
