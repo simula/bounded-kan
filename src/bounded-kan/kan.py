@@ -4,6 +4,50 @@ import torch
 import torch.nn.functional as F
 
 
+class KANInteraction(torch.nn.Module):
+    """
+    Computes explicit feature interactions and their OOB duals.
+
+    Args:
+        interaction_map (list[list[int]]): List of index lists defining the multiplicative terms.
+            Example: [[0, 0], [0, 1]] means add (feats[:,0]^2 and (feats[:,0] * feats[:,1]).
+        grid_range (tuple): The nominal boundaries to compute the dual.
+    """
+    def __init__(self, interaction_map: list[list[int]], grid_range=(-1.0, 1.0)):
+        super().__init__()
+        self.interaction_map = interaction_map
+        self.grid_range = grid_range
+
+    def forward(self, x: torch.Tensor):
+        # 1. Genesis: Calculate initial OOB severity of raw inputs
+        lower_bound, upper_bound = self.grid_range
+        d = F.relu(x - upper_bound) + F.relu(lower_bound - x)
+        if not self.interaction_map:
+            return x, d
+
+        out_x = [x]
+        out_d = [d]
+        for term_indices in self.interaction_map:
+            # Gather the columns for the current interaction (e.g., [0, 0, 1])
+            x_gather = x[:, term_indices]
+            d_gather = d[:, term_indices]
+            x_abs_gather = x_gather.abs()
+            # --- Primal Physics ---
+            # Multiply the physical features together
+            x_interact = torch.prod(x_gather, dim=1, keepdim=True)
+            # --- Dual Severity ---
+            # Total Uncertainty Volume minus Nominal Volume
+            total_vol = torch.prod(x_abs_gather + d_gather, dim=1, keepdim=True)
+            nominal_vol = torch.prod(x_abs_gather, dim=1, keepdim=True)
+            d_interact = total_vol - nominal_vol
+
+            out_x.append(x_interact)
+            out_d.append(d_interact)
+
+        # Concatenate and return the augmented (primal, dual) tuple
+        return torch.cat(out_x, dim=1), torch.cat(out_d, dim=1)
+
+
 class KANLinear(torch.nn.Module):
     def __init__(
         self,
@@ -15,13 +59,15 @@ class KANLinear(torch.nn.Module):
         grid_range=(-1.0, 1.0),
         pure_spline_mode=False,
     ):
-        super(KANLinear, self).__init__()
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.grid_size = grid_size
         self.spline_order = spline_order
         self.grid_range = grid_range
         self.pure_spline_mode = pure_spline_mode
+
+        self.base_activation = base_activation()
 
         # Static grid formulation
         h = (grid_range[1] - grid_range[0]) / grid_size
@@ -38,8 +84,6 @@ class KANLinear(torch.nn.Module):
         self.spline_weight = torch.nn.Parameter(
             torch.Tensor(out_features, in_features, grid_size + spline_order)
         )
-
-        self.base_activation = base_activation()
 
         self.reset_parameters()
 
@@ -81,40 +125,59 @@ class KANLinear(torch.nn.Module):
         )
         return bases.contiguous()
 
-    def forward(self, x: torch.Tensor):
+    def forward_internal(self, x: torch.Tensor, d: torch.Tensor):
+        """
+        Internal forward pass computing both primal (physics) and dual (severity).
+        """
         assert x.size(-1) == self.in_features
         original_shape = x.shape
         x = x.reshape(-1, self.in_features)
+        d = d.reshape(-1, self.in_features)
 
-        # ---------------------------------------------------------
-        # 1. Linear Track (Takes the raw, un-clamped input)
-        # ---------------------------------------------------------
+        # 1. Linear track (primal and dual)
         if self.pure_spline_mode:
             base_output = 0.0
+            dual_output = 0.0
         else:
             effective_weight = self.base_weight + (1.0 / self.in_features)
             base_output = F.linear(self.base_activation(x), effective_weight)
+            # Dual severity propagates purely through absolute weights
+            dual_output = F.linear(d, effective_weight.abs())
 
-        # ---------------------------------------------------------
-        # 2. Spline Track (Plateau and Detach)
-        # ---------------------------------------------------------
+        # 2. Spline track (*clamped* primal only)
         lower_bound, upper_bound = self.grid_range
+        if self.spline_order == 0:
+            # Deg-0 splines lack padding knots, so force the interval open
+            upper_bound -= 1e-6
+        if torch.jit.is_tracing() or x.min() < lower_bound or x.max() > upper_bound:
+            x = x.clamp(lower_bound, upper_bound)
 
-        # Identify features to detach from spline track
-        is_oob = (x < lower_bound) | (x > upper_bound)
-        any_oob = is_oob.any()
-
-        # Evaluate splines with clamped inputs
-        x_clamped = x.clamp(lower_bound, upper_bound) if any_oob else x
         spline_output = F.linear(
-            self.b_splines(x_clamped).view(x.size(0), -1),
+            self.b_splines(x).view(x.size(0), -1),
             self.spline_weight.view(self.out_features, -1),
         )
-        if any_oob:
-            spline_output = torch.where(is_oob, spline_output.detach(), spline_output)
 
-        output = (base_output + spline_output).reshape(*original_shape[:-1], self.out_features)
-        return output
+        if torch.is_grad_enabled() and dual_output.max() > 1e-6:
+            # Gaussian drop-off: exp(-(x * 2.5)^2)
+            # 0.01 -> 99.9% trust (noise is ignored)
+            # 0.10 -> 93.9% trust (minor leakage allowed)
+            # 0.50 -> 20.9% trust (aggressively pinching off)
+            # 1.00 ->  0.1% trust (hard detach)
+            trust = torch.exp(-(dual_output.detach() * 2.5)**2)
+            spline_output = trust * spline_output + (1.0 - trust) * spline_output.detach()
+
+        # 3. Combine and return tuple
+        x_final = (base_output + spline_output).reshape(*original_shape[:-1], self.out_features)
+        d_final = dual_output.reshape(*original_shape[:-1], self.out_features)
+        return x_final, d_final
+
+    def forward(self, x: torch.Tensor):
+        """
+        Public API. Assumes zero incoming severity if used as a standalone layer.
+        """
+        d = torch.zeros_like(x)
+        x_out, _ = self.forward_internal(x, d)
+        return x_out
 
 
 class KAN(torch.nn.Module):
@@ -126,34 +189,34 @@ class KAN(torch.nn.Module):
     (expansions/contractions) during extreme out-of-bounds anomalies.
 
     Args:
-        layers_hidden (list[int]): Architectural dimensions mapping from input to output
-            features (e.g., [input_dim, hidden_dim, output_dim]).
-        grid_size (int, optional): Number of inner intervals partitioning the spline domain
-        spline_order (int, optional): Polynomial degree of the local B-spline bases.
-        base_activation (torch.nn.Module, optional): Activation function applied exclusively
-            to the linear track. Use with caution - see README!
-        grid_range (tuple[float, float], optional): Physical bounds `(lower, upper)` defining
-            the spline evaluation domain.
-        pure_spline_mode (bool, optional): If True, completely disables the linear track
-            across all child layers, forcing hard saturation/clipping at boundaries instead
-            of proportional linear extrapolation.
+        layers: Architectural dimensions mapping from input to output features (e.g., [input_dim, hidden_dim, output_dim]).
+        grid_size: Number of inner intervals partitioning the spline domain
+        spline_order: Polynomial degree of the local B-spline bases.
+        base_activation: Activation function applied exclusively to the linear track. Change with caution - see README!
+        grid_range: Physical bounds `(lower, upper)` defining the spline evaluation domain.
+        pure_spline_mode: If True, completely disables the linear track across all child layers, forcing hard
+            saturation/clipping at boundaries instead of proportional linear extrapolation.
+        interaction_map: Multiplicative feature interaction indices. Use to define explicit cross-terms while preserving
+            strict OOB propagation.
     """
 
     def __init__(
         self,
-        layers_hidden,
-        grid_size=5,
-        spline_order=3,
-        base_activation=torch.nn.Identity,
-        grid_range=(-1.0, 1.0),
-        pure_spline_mode=False,
+        layers: list[int],
+        grid_size: int = 5,
+        spline_order: int = 3,
+        base_activation: torch.nn.Module = torch.nn.Identity,
+        grid_range: tuple[float, float] = (-1.0, 1.0),
+        pure_spline_mode: bool = False,
+        interaction_map: list[list[int]] = [],
     ):
-        super(KAN, self).__init__()
-        self.grid_size = grid_size
-        self.spline_order = spline_order
+        super().__init__()
+        self.interactor = KANInteraction(interaction_map, grid_range)
+        layers_hidden = list(layers_hidden)
+        layers_hidden[0] += len(interaction_map)
 
         self.layers = torch.nn.ModuleList()
-        for in_features, out_features in zip(layers_hidden, layers_hidden[1:]):
+        for in_features, out_features in zip(layers, layers[1:]):
             self.layers.append(
                 KANLinear(
                     in_features,
@@ -166,7 +229,16 @@ class KAN(torch.nn.Module):
                 )
             )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor], return_dual: bool = False):
+        if isinstance(x, tuple):
+            if self.interactor.interaction_map:
+                raise ValueError("Both explicit and implicit interactions supplied. This is not supported.")
+            x, d = inputs
+        else:
+            x, d = self.interactor(x)
+
+        # Route features along with dual through the layers
         for layer in self.layers:
-            x = layer(x)
-        return x
+            x, d = layer.forward_internal(x, d)
+
+        return (x, d) if return_dual else x
