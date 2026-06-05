@@ -18,6 +18,12 @@ class KANInteraction(torch.nn.Module):
         self.interaction_map = interaction_map
         self.grid_range = grid_range
 
+    def extra_repr(self) -> str:
+        return (
+            f"interaction_map={self.interaction_map}, "
+            f"grid_range={self.grid_range}"
+        )
+
     def forward(self, x: torch.Tensor):
         # 1. Genesis: Calculate initial OOB severity of raw inputs
         lower_bound, upper_bound = self.grid_range
@@ -96,6 +102,15 @@ class KANLinear(torch.nn.Module):
             with torch.no_grad():
                 self.base_weight -= self.base_weight.mean(dim=1, keepdim=True)
         torch.nn.init.zeros_(self.spline_weight)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"grid_size={self.grid_size}, "
+            f"spline_order={self.spline_order}, "
+            f"grid_range={self.grid_range}"
+        )
 
     def b_splines(self, x: torch.Tensor):
         """Compute the B-spline bases for the given input tensor.
@@ -189,7 +204,7 @@ class KAN(torch.nn.Module):
     (expansions/contractions) during extreme out-of-bounds anomalies.
 
     Args:
-        layers: Architectural dimensions mapping from input to output features (e.g., [input_dim, hidden_dim, output_dim]).
+        layer_dims: Architectural dimensions mapping from input to output features (e.g., [input_dim, hidden_dim, output_dim]).
         grid_size: Number of inner intervals partitioning the spline domain
         spline_order: Polynomial degree of the local B-spline bases.
         base_activation: Activation function applied exclusively to the linear track. Change with caution - see README!
@@ -202,7 +217,7 @@ class KAN(torch.nn.Module):
 
     def __init__(
         self,
-        layers: list[int],
+        layer_dims: list[int],
         grid_size: int = 5,
         spline_order: int = 3,
         base_activation: torch.nn.Module = torch.nn.Identity,
@@ -212,11 +227,12 @@ class KAN(torch.nn.Module):
     ):
         super().__init__()
         self.interactor = KANInteraction(interaction_map, grid_range)
-        layers_hidden = list(layers_hidden)
-        layers_hidden[0] += len(interaction_map)
+        self.layer_dims = layer_dims
+        eff_layer_dims = list(layer_dims)
+        eff_layer_dims[0] += len(interaction_map)
 
         self.layers = torch.nn.ModuleList()
-        for in_features, out_features in zip(layers, layers[1:]):
+        for in_features, out_features in zip(eff_layer_dims, eff_layer_dims[1:]):
             self.layers.append(
                 KANLinear(
                     in_features,
@@ -229,12 +245,22 @@ class KAN(torch.nn.Module):
                 )
             )
 
+    def extra_repr(self) -> str:
+        # Most information is already in the layers, just add the pre-interactions dim
+        return (
+            f"in_features={self.layer_dims[0]}"
+        )
+
     def forward(self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor], return_dual: bool = False):
         if isinstance(x, tuple):
             if self.interactor.interaction_map:
                 raise ValueError("Both explicit and implicit interactions supplied. This is not supported.")
             x, d = inputs
+            if x.shape[1] != self.layers[0].in_features:
+                raise ValueError(f"Wrong input dimension {x.shape[1]}, expected {self.layers[0].in_features}")
         else:
+            if x.shape[1] != self.layer_dims[0]:
+                raise ValueError(f"Wrong input dimension {x.shape[1]}, expected {self.layer_dims[0]}")
             x, d = self.interactor(x)
 
         # Route features along with dual through the layers

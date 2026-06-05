@@ -134,13 +134,13 @@ interactions = [[0, 0], [0, 2]]
 # The KAN model automatically expands the initial input dimension
 # and sets up the continuous dual routing.
 kan_encoder = KAN(
-    layers_hidden=[3, 16, 8], # Input dim is 3 (wave, wind, cos_dir)
+    layers_dims=[3, 16, 8], # Input dim is 3 (wave, wind, cos_dir)
     grid_range=(0.0, 1.0),
     interaction_map=interactions
 )
 
-# The readout: Strictly linear combination of the final observables
-linear_mixer = nn.Linear(in_features=8, out_features=1)
+# The readout: Linear combination of the final observables of a zero-at-rest (unbiased) system
+linear_mixer = nn.Linear(in_features=8, out_features=1, bias=False)
 
 model = nn.Sequential(
     kan_encoder,
