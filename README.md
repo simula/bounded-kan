@@ -2,22 +2,29 @@
 
 **Physics-constrained Kolmogorov-Arnold Networks for stable system identification**
 
-This repository provides a structural adaptation of the B-spline Kolmogorov-Arnold Network (KAN) architecture, designed for physical system identification, digital twins, and robust regression. 
+This repository provides a structural adaptation of the B-spline Kolmogorov-Arnold Network (KAN) architecture, designed for physical system identification, digital twins, and robust regression.
 
-It introduces forward uncertainty propagation using interval arithmetic to track out-of-distribution (OOD) states natively.
-While standard KANs perform well at function approximation in purely mathematical domains, applying them to physical telemetry often requires interventions, like dynamic grid updates or statistical normalization such as LayerNorm, to handle out-of-bounds (OOB) anomalies. In this context, OOB refers to any data point that exceeds the nominal operational range of the system, whether caused by a real but long-tail phenomenon (e.g., unseen weather regimes) or a transient sensor failure (e.g., signal spikes). Unfortunately, these standard deep learning techniques remove the spatial meaning of the network's internal variables. 
+While standard KANs perform well at function approximation in purely mathematical domains, applying them to physical telemetry often requires interventions, like dynamic grid updates or statistical normalization such as LayerNorm, to handle out-of-bounds (OOB) anomalies.
+In this context, OOB refers to any data point that exceeds the nominal operational range of the system, whether caused by a real but long-tail phenomenon (e.g., unseen weather regimes) or a transient sensor failure (e.g., signal spikes).
+Unfortunately, these standard deep learning techniques remove the spatial meaning of the network's internal variables.
 
 This architecture addresses this by freezing the spatial grid and enforcing strict physical bounds natively, prioritizing metric stability and OOB safety over localized curve-fitting flexibility.
+It also uses forward uncertainty propagation with interval arithmetic to track the OOB state through the network.
+
 
 ## Core design philosophy
 
 Bounded-KAN is built on three central ideas, meant to bridge the gap between theoretical non-linear mapping and the robust fail-safes required for physical engineering:
 
-1. **Progressive Koopman-style unbending:** Rather than relying on black-box MLP node activations, the model acts as a structural filter. It uses constrained B-splines to progressively unbend non-linear physical inputs layer-by-layer, lifting them into a linearized latent space (analogous to finding "observables" in Koopman Operator Theory).
+1. **Progressive Koopman-style unbending:** Rather than relying on black-box MLP node activations, the model acts as a structural filter.
+It uses constrained B-splines to progressively unbend non-linear physical inputs layer-by-layer, lifting them into a linearized latent space (analogous to finding "observables" in Koopman Operator Theory).
 
-2. **Embrace out-of-bounds (OOB) values:** Real-world physics do not stay neatly within standardized grids. Instead of arbitrarily squashing long-tail events or sensor glitches with global activations (`tanh`, `SiLU`), the architecture encourages grid overflow. OOB states are safely clamped on the non-linear spline track and routed unclamped through a parallel linear track, ensuring mathematically stable extrapolation.
+2. **Embrace out-of-bounds (OOB) values:** Real-world physics do not stay neatly within standardized grids.
+Instead of arbitrarily squashing long-tail events or sensor glitches with clamps or global activations, the architecture uses the grid range to explicitly define the boundary between the dense, well-modeled operational regime and the sparse, asymptotic tail.
+OOB states are safely clamped on the non-linear spline track and routed unclamped through a parallel linear track, ensuring mathematically stable extrapolation.
 
-3. **Epistemic uncertainty tracking:** The network computes a continuous dual property alongside the physical prediction. Using interval arithmetic, this signal strictly forward-propagates the mathematical severity of any out-of-bounds state, providing a deterministic measure of when the network is forced to extrapolate.
+3. **Epistemic uncertainty tracking:** The network computes a continuous dual property alongside the physical prediction.
+This signal forward-propagates the mathematical severity of any out-of-bounds state, providing a deterministic measure of when the network is forced to extrapolate.
 
 ---
 
@@ -25,11 +32,14 @@ Bounded-KAN is built on three central ideas, meant to bridge the gap between the
 
 To safely execute this philosophy, the network requires a specific mental model for how it routes data—especially during the backward pass.
 
-In standard implementations, out-of-bounds data either "falls off" the spline grid entirely (dropping to zero) or requires the input to be naively clamped. However, if clamped *without* gradient detachment, the model forces the boundary knot to absorb the training loss for all out-of-bounds states. The boundary knot becomes a wastebasket for outlying values, compressing the long-tail distribution into a single coordinate and warping predictions for nominal operations.
+In standard implementations, out-of-bounds data either "falls off" the spline grid entirely (dropping to zero) or requires the input to be clamped or bounded.
+However, if clamped *without* gradient detachment, the boundary knot absorbs the training loss for all out-of-bounds states.
+It becomes a wastebasket for outlying values, compressing the long-tail distribution into a single coordinate and warping predictions for nominal operations.
 
-This architecture acts as a traffic cop for physical regimes:
+The Bounded-KAN architecture acts as a traffic cop for physical regimes:
 * **The nominal regime (non-linear track):** Dense, expected data operates inside the grid, shaping the non-linear B-splines.
-* **The out-of-bounds regime (linear track):** OOB data are clamped on the non-linear track (with detached gradients to protect the nominal knots). The excess signal flows entirely through the linear track. 
+* **The out-of-bounds regime (linear track):** OOB data are clamped on the non-linear track (with detached gradients to protect the nominal-range knots).
+The excess signal flows entirely through the linear track.
 
 This ensures the non-linear splines strictly learn the nominal physics, while the linear track safely catches long-tail events.
 
@@ -38,53 +48,66 @@ This ensures the non-linear splines strictly learn the nominal physics, while th
 To maintain the absolute physical meaning of these latent observables during deployment, the model relies on two structural constraints:
 
 ### 1. Static grid boundaries
-Original KAN architectures often rely on dynamic grid updates (knot insertion or movement) during training. This architecture strictly disables this. Dynamic updates shift the underlying coordinate system of the network mid-training, causing downstream layers to lose their physical calibration. By enforcing a static grid, the model sacrifices some theoretical curve-fitting capacity to guarantee that a specific latent state retains its exact metric meaning from initialization to deployment.
 
-#### Inter-layer out-of-bounds preservation
-
-To guarantee that OOB retains its physical magnitude through deep layers, the network relies on a standard residual macro-architecture rather than dynamic normalization:
-
-**Global residual skip connections**
-Dynamic scaling (e.g., layer normalization) is disabled, as batch-dependent variance adjustments remove both the absolute magnitude of physical metrics and the linear OOB safety valve. Instead, layers are wrapped in standard residual blocks ($y = x + \text{KAN}(x)$). 
-
-Standard L2 weight decay (via AdamW) gently pressures the internal linear weights toward zero. Consequently, during an anomaly, the saturated layer's contribution minimizes, allowing the global identity skip connection to act as a physical passthrough. This preserves the scale of OOB events across arbitrary depths without requiring custom loss functions, matrix adjustments, or normalization layers.
+KAN architectures often rely on dynamic grid updates (knot insertion or movement) during training.
+This architecture disables this.
+Dynamic updates shift the underlying coordinate system of the network mid-training, causing downstream layers to lose their physical calibration.
+By enforcing a static grid, the model sacrifices some theoretical curve-fitting capacity to guarantee that a specific latent state retains its exact metric meaning from initialization to deployment.
 
 ### 2. Linear skip connections as safety valves
-Because the spline gradients are detached for OOB values, the network routes the excess gradients entirely through the parallel linear skip connection. This serves as a vital safety valve: it protects the non-linear splines from gradient pollution, and it ensures that OOB inputs extrapolate linearly and predictably. This limits the downstream impact of anomalies, making system filtering more reliable.
+Because the spline gradients are detached for OOB values, the network routes the excess gradients entirely through the parallel linear skip connection.
+This serves as a vital safety valve: it protects the non-linear splines from gradient pollution, and it ensures that OOB inputs extrapolate linearly and predictably.
+This limits the downstream impact of anomalies, making system filtering more reliable.
 
 #### Justification for linear extrapolation (physical basis functions)
 
-While real-world OOB events often exhibit higher-order scaling (e.g., cubic wave resistance), the model enforces a linear default for OOB extrapolation. This is a deliberate design choice to prevent mathematical instability caused by sensor faults. 
+While real-world OOB events often exhibit higher-order scaling (e.g., cubic wave resistance), the model enforces a linear default for OOB extrapolation.
+This is a deliberate design choice to prevent mathematical instability caused by sensor faults. 
 
-To safely capture higher-order OOB physics, domain knowledge should be embedded directly via feature engineering. As long as the input features form a sufficient physical basis, particularly for asymptotic behaviours, the linear skip connection will naturally capture higher-order OOB phenomena without compromising the nominal operating region.
+To safely capture higher-order OOB physics, domain knowledge should be embedded directly via feature engineering.
+As long as the input features form a sufficient physical basis, particularly for asymptotic behaviours, the linear skip connection will naturally capture higher-order OOB phenomena as a linear combination of features without compromising the nominal operating region.
 
-Applying a post-summation node activation (such as `SiLU` or `Tanh`) fundamentally sabotages this mechanism. A non-linear activation will warp the magnitude of the OOB event, rendering the linear skip connection unable to model it. For this reason, activations are disabled by default (using `Identity`). 
+Applying a post-summation node activation (such as `SiLU` or `tanh`) fundamentally sabotages this mechanism.
+A non-linear activation will warp the magnitude of the OOB event, rendering the linear skip connection unable to model it.
+For this reason, activations are disabled by default (using `Identity`).
+Other activations may be selected, but beware that the guarantees provided by "standard" Bounded-KAN may be weakened or destroyed.
 
 ## Feature engineering and explicit interactions
 
-While deep architectures can theoretically learn multiplicative interactions (such as computing `x * y` by combining multiple layers), forcing the network to deduce these relationships from scratch consumes capacity and degrades poorly when out-of-bounds. 
+Deep architectures can theoretically learn multiplicative interactions (such as computing `x * y` by combining multiple layers).
+Making the network deduce these relationships from scratch consumes capacity and degrades poorly when out-of-bounds.
+Instead, to capture known physical behaviors, domain knowledge should be embedded directly via feature engineering.
+Providing the network with a dictionary of physical basis functions (e.g., `x^2` or `cos(θ)`) allows the linear skip connection to latch onto these engineered features as a stable baseline.
+This leaves the splines to map the local residuals, ensuring safe extrapolation when the splines saturate.
 
-To capture known physical behaviors, domain knowledge should be embedded directly via feature engineering. Providing the network with a dictionary of physical basis functions (e.g., `x^2` or `cos(θ)`) allows the linear skip connection to latch onto these engineered features as a stable baseline. This leaves the splines to map the local residuals, ensuring safe extrapolation when the splines saturate.
+However, combining features naively can mask out-of-bounds anomalies.
+If you manually pre-compute an interaction like `wave_height * cos(wind_dir)` and pass it to the network as a raw input, the anomaly signal is suppressed.
+For instance, if `wave_height` is OOB (e.g., twice nominal range) but `cos(wave_dir)` is near zero, their product is well within nominal bounds.
+The model treats this as a regular in-bounds prediction, and uses the data point to update its nominal-range spline.
 
-### The multiplicative suppression problem and OOB dual
+To prevent this suppression, the network requires interaction terms to be defined internally via an `interaction_map` rather than expanded manually beforehand.
 
-Standard neural networks can inadvertently mask out-of-bounds anomalies when features are combined. If you manually pre-compute an interaction like `wave_height * cos(wind_dir)` and pass it to the network as a raw input, the anomaly signal is suppressed.  For instance, if `wave_height` is OOB (e.g., twice nominal range) but `cos(wave_dir)` is near zero, their product is within nominal bounds. A standard model outputs a regular in-bounds prediction, ignoring the underlying OOB wave height. 
+The network computes a continuous dual property alongside the standard physical prediction.
+This dual represents the mathematical severity of the out-of-bounds state. 
+* The *physical prediction* is computed using the non-linear splines and the linear track.
+* The *dual severity* strictly bypasses the splines and propagates via the absolute values of the linear weights, ensuring that uncertainties compound and never cancel out.
 
-To prevent this suppression, the network requires interaction terms to be defined internally via an `interaction_map` rather than expanded manually beforehand. 
-
-The network computes a continuous dual property ($D$) alongside the standard physical prediction. This dual represents the mathematical severity of the out-of-bounds state. 
-* The physical prediction is computed using the non-linear splines and the linear track.
-* The dual severity strictly bypasses the splines and propagates via the absolute values of the linear weights, ensuring that uncertainties compound and never cancel out.
-
-By defining interactions explicitly through the `interaction_map`, the model correctly applies the uncertainty product rule to the input features before they enter the network. If a large wave anomaly interacts with a nominal-range cosine, the resulting interaction term inherits a proportional severity score. This results in a deterministic distress signal that persists through the entire depth of the network, ensuring that underlying OOB is routed through the linear track and optionally providing downstream consumer with an indicator of when the model is operating on mathematically contaminated data.
+By defining interactions explicitly through the `interaction_map`, the model correctly applies the uncertainty product rule to the input features before they enter the network.
+If a large wave anomaly interacts with a nominal-range cosine, the resulting interaction term inherits a proportional severity score.
+This deterministic distress signal persists through the entire depth of the network, ensuring that the non-linear splines are firewalled from learning from the anomaly, while the linear track safely handles the extrapolated magnitude.
+It also provides downstream consumers with a clear indicator of when the model is operating on dodgy data.
 
 ### Defining the nominal range: data density vs. physical limits
 
-When defining the `grid_range` and normalizing inputs, the boundaries should reflect the density of the training data rather than the theoretical limits of the physical system. 
+When defining the `grid_range` and normalizing inputs, the boundaries should reflect the density of the training data rather than the theoretical limits of the physical system.
 
-B-splines require consistent data distribution across their internal grid to form a stable curve. If a physical feature (such as wave height) has a theoretical operational limit of 5.0 meters, but the training dataset becomes sparse above 2.0 meters, setting the spline boundary to 5.0 meters forces the model to fit curves in an under-constrained region. This often causes the splines to oscillate or overfit to a handful of isolated data points.
+B-splines require consistent data distribution across their internal grid to form a stable curve.
+If for example a physical feature (such as wave height) has a theoretical operational limit of 5.0 meters, but the training dataset becomes sparse above 2.0 meters, setting the spline boundary to 5.0 meters forces the model to fit curves in an under-constrained region.
+This often causes the splines to oscillate or overfit to a handful of isolated data points.
 
-Instead, the grid boundary should be placed where the data density noticeably drops off (e.g., at 2.0 meters). By treating the sparse region as out-of-bounds, the network safely clamps the splines in the dense region and relies on the linear track to extrapolate smoothly through the sparse tail. The working principle is to treat the nominal range strictly as the bounds of the dense training data.
+Instead, the grid boundary should be placed where the data density noticeably drops off (e.g., at 2.0 meters).
+By treating the sparse region as out-of-bounds, the network safely clamps the splines in the dense region and relies on the linear track to extrapolate smoothly through the sparse tail.
+The working principle is to treat the nominal range strictly as the bounds of the dense training data.
 
 ## Installation
 
@@ -143,6 +166,8 @@ if severity_oob.mean() > 0.0:
 
 ## Attribution
 
-This repository is an adaptation of the excellent **[efficient-kan](https://github.com/Blealtan/efficient-kan)** library by Blealtan. 
+This repository is an adaptation of the excellent **[efficient-kan](https://github.com/Blealtan/efficient-kan)** library by Blealtan.
 
-The core B-spline evaluation mechanics, memory-efficient tensor formulation, and foundational matrix operations are directly derived from `efficient-kan`. The modifications introduced here are strictly architectural (specifically the detached routing, strict boundary clamping, interval arithmetic dual, and default identity activations) designed to constrain the network for physical system identification. Full credit for the underlying efficiency and base implementation belongs to the original author.
+The core B-spline evaluation mechanics, memory-efficient tensor formulation, and foundational matrix operations are directly derived from `efficient-kan`.
+The modifications introduced here are strictly architectural (specifically the detached routing, strict boundary clamping, interval arithmetic dual, and default identity activations) designed to constrain the network for physical system identification.
+Full credit for the underlying efficiency and base implementation belongs to the original author.
