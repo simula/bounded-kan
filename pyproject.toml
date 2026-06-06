@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "bounded-kan"
+name = "physkan"
 version = "0.1.0"
 description = "A physics-constrained Kolmogorov-Arnold Network with bounded latent spaces."
 readme = "README.md"

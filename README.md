@@ -1,4 +1,4 @@
-# Bounded-KAN
+# PhysKAN
 
 **Physics-constrained Kolmogorov-Arnold Networks for stable system identification**
 
@@ -14,7 +14,7 @@ It also uses forward uncertainty propagation with interval arithmetic to track t
 
 ## Core design philosophy
 
-Bounded-KAN is built on three central ideas, meant to bridge the gap between theoretical non-linear mapping and the robust fail-safes required for physical engineering:
+PhysKAN is built on three central ideas, meant to bridge the gap between theoretical non-linear mapping and the robust fail-safes required for physical engineering:
 
 1. **Progressive Koopman-style unbending:** Rather than relying on black-box MLP node activations, the model acts as a structural filter.
 It uses constrained B-splines to progressively unbend non-linear physical inputs layer-by-layer, lifting them into a linearized latent space (analogous to finding "observables" in Koopman Operator Theory).
@@ -36,7 +36,7 @@ In standard implementations, out-of-bounds data either "falls off" the spline gr
 However, if clamped *without* gradient detachment, the boundary knot absorbs the training loss for all out-of-bounds states.
 It becomes a wastebasket for outlying values, compressing the long-tail distribution into a single coordinate and warping predictions for nominal operations.
 
-The Bounded-KAN architecture acts as a traffic cop for physical regimes:
+The PhysKAN architecture acts as a traffic cop for physical regimes:
 * **The nominal regime (non-linear track):** Dense, expected data operates inside the grid, shaping the non-linear B-splines.
 * **The out-of-bounds regime (linear track):** OOB data are clamped on the non-linear track (with detached gradients to protect the nominal-range knots).
 The excess signal flows entirely through the linear track.
@@ -70,7 +70,7 @@ As long as the input features form a sufficient physical basis, particularly for
 Applying a post-summation node activation (such as `SiLU` or `tanh`) fundamentally sabotages this mechanism.
 A non-linear activation will warp the magnitude of the OOB event, rendering the linear skip connection unable to model it.
 For this reason, activations are disabled by default (using `Identity`).
-Other activations may be selected, but beware that the guarantees provided by "standard" Bounded-KAN may be weakened or destroyed.
+Other activations may be selected, but beware that the guarantees provided by "standard" PhysKAN may be weakened or destroyed.
 
 ## Feature engineering and explicit interactions
 
@@ -114,7 +114,7 @@ The working principle is to treat the nominal range strictly as the bounds of th
 You can install the package directly from GitHub:
 
 ```bash
-pip install git+[https://github.com/simula/bounded-kan.git](https://github.com/simula/bounded-kan.git)
+pip install git+[https://github.com/simula/physkan.git](https://github.com/simula/physkan.git)
 
 ## Usage example
 
@@ -123,7 +123,7 @@ The model handles explicit feature expansion and interval arithmetic internally.
 ```python
 import torch
 import torch.nn as nn
-from bounded_kan import KAN
+from physkan import KAN
 
 # Define explicit cross-terms using indices
 # e.g., for features [wave, wind, cos_dir]:
