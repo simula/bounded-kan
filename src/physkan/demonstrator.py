@@ -25,11 +25,11 @@ class KANDemonstrator:
         for _ in range(epochs):
             optimizer.zero_grad()
             # Expecting the network to return (primal_prediction, dual_severity)
-            y_pred, d_pred = self.model(features)
+            y_pred, d_pred = self.model(features, return_dual=True)
             loss = criterion(y_pred, y_train)
             loss.backward()
             optimizer.step()
-            
+
         return loss.item()
 
     def predict(self, x_raw):
@@ -37,7 +37,7 @@ class KANDemonstrator:
         self.model.eval()
         features = self.feature_fn(x_raw)
         with torch.no_grad():
-            y_pred, d_pred = self.model(features)
+            y_pred, d_pred = self.model(features, return_dual=True)
         return y_pred, d_pred
 
     def plot(self, x_raw_eval, title="KAN Demonstration", x_axis_idx=0):

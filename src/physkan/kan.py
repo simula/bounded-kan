@@ -186,13 +186,13 @@ class KANLinear(torch.nn.Module):
         d_final = dual_output.reshape(*original_shape[:-1], self.out_features)
         return x_final, d_final
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_dual: bool = False):
         """
         Public API. Assumes zero incoming severity if used as a standalone layer.
         """
         d = torch.zeros_like(x)
-        x_out, _ = self.forward_internal(x, d)
-        return x_out
+        x_out, d_out = self.forward_internal(x, d)
+        return (x_out, d_out) if return_dual else x_out
 
 
 class KAN(torch.nn.Module):
