@@ -33,6 +33,7 @@ lint.ignore = [
     "D102", # missing docstring in public class
     "D105", # undocumented-magic-method; fine if obvious, otherwise comment
     "D107", # undocumented-public-init; would like to still enforce arg docs (D417) for these but doesn't work
+    "D205", # blank line between summary and description
     "E731", # lambda-assignment; fine if used sparingly
     "E741", # ambiguous-variable-name (l, O, I); fine if used locally
 ]
