@@ -4,13 +4,39 @@ build-backend = "hatchling.build"
 
 [project]
 name = "physkan"
-version = "0.1.0"
+version = "0.1.1"
 description = "A physics-constrained Kolmogorov-Arnold Network with bounded latent spaces."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.9.0",
 ]
+
+authors = [
+    { name = "Joachim B Haga", email = "jobh@simula.no" }
+]
+keywords = [
+    "machine-learning", 
+    "kolmogorov-arnold-network", 
+    "kan", 
+    "physics-informed", 
+    "system-identification", 
+    "control-theory"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/simula/physkan"
+Repository = "https://github.com/simula/physkan"
+"Bug Tracker" = "https://github.com/simula/physkan/issues"
 
 [project.optional-dependencies]
 dev = [
