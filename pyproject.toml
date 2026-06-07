@@ -2,9 +2,18 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tools.hatch.build]
+include = [
+        "pyproject.toml",
+        "src/physkan",
+        "demo",
+        "README.md",
+        "LICENSE",
+] 
+
 [project]
 name = "physkan"
-version = "0.1.1"
+version = "0.1.2"
 description = "A physics-constrained Kolmogorov-Arnold Network with bounded latent spaces."
 readme = "README.md"
 requires-python = ">=3.12"
