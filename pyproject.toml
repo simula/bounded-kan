@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 include = [
         "pyproject.toml",
         "src/physkan",
-        "demo",
         "README.md",
         "LICENSE",
 ] 

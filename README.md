@@ -134,27 +134,25 @@ criterion = nn.MSELoss()
 x_nominal = torch.tensor([[0.5, 0.1]])
 
 # Pass data through the model
-prediction, severity_signal = model(x_nominal)
+prediction, severity_signal, _ = model(x_nominal, return_dual=True)
 
 # For an out-of-bounds event
 x_oob = torch.tensor([[4.0, 0.1]])
-prediction_oob, severity_oob = model(x_oob)
+prediction_oob, severity_oob, _ = model(x_oob, return_dual=True)
 
 # Severity greater than zero indicates the prediction relies on extrapolated values.
-if severity_oob.mean() > 0.0:
+if severity_oob.max() > 0.0:
     print("Warning: operating in uncharted physical regime.")
 ```
 
 ## Demos
 
-To see the out-of-bounds routing, cancellation entanglement, and hybrid symbolic architecture in action, please review the demonstrator notebooks provided in the `demos/` directory of this repository.
+To see the out-of-bounds routing, cancellation entanglement, and hybrid symbolic architecture in action, please review the demonstrator notebooks provided in this repository, starting with `demo/demo.py`.
 
 ## Attribution
 
-This repository is an adaptation of the `efficient-kan` library by Blealtan.
-
+This repository is an adaptation of the excellent `efficient-kan` library by Blealtan.
 The B-spline evaluation mechanics, memory-efficient tensor formulation, and matrix operations are derived from that work.
-
 The modifications introduced here are architectural, designed to constrain the network for physical system identification.
 
 Credit for the underlying efficiency and base implementation belongs to the original author.

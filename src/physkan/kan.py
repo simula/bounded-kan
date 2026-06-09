@@ -1,10 +1,12 @@
 import copy
 import inspect
 import math
+from functools import cached_property
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.quasirandom import SobolEngine
 
 from .interaction import KANInteraction, PolynomialSkip
 
@@ -20,7 +22,9 @@ class KANLinear(torch.nn.Module):
         grid_range=(-1.0, 1.0),
         spline_dropout=0.0,
         pure_spline_mode=False,
+        transition_overlap=0.0,
         _quiet_init=False,
+        _is_hidden_layer=False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -41,13 +45,27 @@ class KANLinear(torch.nn.Module):
         else:
             raise ValueError("base_activation must be a class, module instance, or callable.")
 
-        # Static grid formulation
-        h = (grid_range[1] - grid_range[0]) / grid_size
-        grid = (
-            (torch.arange(-spline_order, grid_size + spline_order + 1) * h + grid_range[0])
-            .expand(in_features, -1)
-            .contiguous()
-        )
+        # Standardize grid_range into a broadcastable tensor
+        if not isinstance(grid_range, torch.Tensor):
+            grid_range = torch.tensor(grid_range, dtype=torch.float32)
+        else:
+            grid_range = grid_range.float().clone()
+        if grid_range.dim() == 1 and grid_range.size(0) == 2:
+            _bounds = grid_range.unsqueeze(0)  # Shape: (1, 2)
+        elif grid_range.dim() == 2 and grid_range.size() == (in_features, 2):
+            _bounds = grid_range  # Shape: (in_features, 2)
+        else:
+            raise ValueError(f"grid_range must be shape (2,) or ({in_features}, 2). Got {grid_range.shape}")
+        self.register_buffer("grid_bounds", _bounds)
+
+        # 2. Vectorized static grid formulation
+        lower, upper = self.grid_bounds.T.unsqueeze(-1)
+        h = (upper - lower) / grid_size
+        self.register_buffer("h", h)
+        # Base steps shape: (1, grid_size + 2*spline_order + 1)
+        steps = torch.arange(-spline_order, grid_size + spline_order + 1, dtype=torch.float32).unsqueeze(0)
+        # Broadcasted grid shape: (1, num_knots) OR (in_features, num_knots)
+        grid = (steps * h + lower).contiguous()
         self.register_buffer("grid", grid)
 
         # The two parallel tracks
@@ -57,7 +75,19 @@ class KANLinear(torch.nn.Module):
             torch.Tensor(out_features, in_features, grid_size + spline_order)
         )
 
+        # Calculate available cushion and trust region
+        detach_threshold = 1e-3  # gradient influence at edge of trust region
+        loose_fraction = 2.0  #  width of trust region (relative to crumple) at no quarantine
+        strict_fraction = 0.5  # width of trust region at full quarantine
+        crumple_zone = self.spline_order * self.h
+        cushion = transition_overlap * (crumple_zone - 1e-6)
+        self.register_buffer("bounds_cushion", torch.cat([-cushion, cushion]))
+        trust_scale = crumple_zone / math.sqrt(-math.log(detach_threshold))
+        trust_padding = transition_overlap * loose_fraction + (1.0 - transition_overlap) * strict_fraction
+        self.register_buffer("trust_scale", trust_scale * trust_padding)
+
         self.reset_parameters(_quiet_init)
+        self.is_hidden_layer = _is_hidden_layer
 
     def reset_parameters(self, quiet=False):
         if not self.pure_spline_mode:
@@ -108,6 +138,21 @@ class KANLinear(torch.nn.Module):
         )
         return bases.contiguous()
 
+    def get_stiffness_loss(self, n=1, lambda_l1=0.0, lambda_l2=0.0):
+        """
+        Computes the 1st-order Elastic Net (L1 + L2) stiffness penalty,
+        scaled by the physical knot step size (h) to maintain invariance across grid sizes.
+        """
+        penalty = 0.0
+        h_bcast = self.h.view(1, -1, 1)  # Align dimensions for broadcasting
+        diff1 = self.spline_weight.diff(n=n, dim=2)
+        slope = diff1 / h_bcast
+        if lambda_l1 > 0:
+            penalty += lambda_l1 * slope.abs().mean()
+        if lambda_l2 > 0:
+            penalty += lambda_l2 * slope.pow(2).mean()
+        return penalty
+
     def forward_internal(self, x: torch.Tensor, d: torch.Tensor):
         """Internal forward pass computing both primal (physics) and dual (severity)."""
         assert x.size(-1) == self.in_features
@@ -118,20 +163,26 @@ class KANLinear(torch.nn.Module):
         # 1. Linear track (primal and dual)
         if self.pure_spline_mode:
             base_output = 0.0
-            dual_output = 0.0
         else:
             effective_weight = self.base_weight + (1.0 / self.in_features)
             base_output = F.linear(self.base_activation(x), effective_weight)
-            # Dual severity propagates purely through absolute weights
-            dual_output = F.linear(d, effective_weight.abs())
+        # Dual severity propagates purely through absolute weights
+        lower_bound, upper_bound = self.grid_bounds.T
+        total_importance = effective_weight.abs() + self.spline_weight.abs().amax(dim=2)
+        if self.is_hidden_layer:
+            local_damage = F.relu(x - upper_bound) + F.relu(lower_bound - x)
+            d = d + local_damage
+        else:
+            local_damage = None
+        dual_output = F.linear(d, total_importance)
 
         # 2. Spline track (*clamped* primal only)
-        lower_bound, upper_bound = self.grid_range
+        lower_bound_ex, upper_bound_ex = self.grid_bounds.T + self.bounds_cushion
         if self.spline_order == 0:
             # Deg-0 splines lack padding knots, so force the interval open
-            upper_bound -= 1e-6
-        if torch.jit.is_tracing() or x.min() < lower_bound or x.max() > upper_bound:
-            x = x.clamp(lower_bound, upper_bound)
+            upper_bound_ex = upper_bound_ex - 1e-6
+        if torch.jit.is_tracing() or (x.amin(dim=0) < lower_bound_ex).any() or (x.amax(dim=0) > upper_bound_ex).any():
+            x = x.clamp(min=lower_bound_ex, max=upper_bound_ex)
 
         spline_output = F.linear(
             self.b_splines(x).view(x.size(0), -1),
@@ -141,24 +192,19 @@ class KANLinear(torch.nn.Module):
             spline_output = F.dropout(spline_output, p=self.spline_dropout, training=self.training)
 
         if torch.is_grad_enabled() and dual_output.max() > 1e-6:
-            # Gaussian drop-off: exp(-(x * 2.5)^2)
-            # 0.01 -> 99.9% trust (noise is ignored)
-            # 0.10 -> 93.9% trust (minor leakage allowed)
-            # 0.50 -> 20.9% trust (aggressively pinching off)
-            # 1.00 ->  0.1% trust (hard detach)
-            trust = torch.exp(-((dual_output.detach() * 2.5) ** 2))
+            trust = torch.exp(-((dual_output.detach() / self.trust_scale) ** 2))
             spline_output = trust * spline_output + (1.0 - trust) * spline_output.detach()
 
         # 3. Combine and return tuple
         x_final = (base_output + spline_output).reshape(*original_shape[:-1], self.out_features)
         d_final = dual_output.reshape(*original_shape[:-1], self.out_features)
-        return x_final, d_final
+        return x_final, d_final, local_damage
 
     def forward(self, x: torch.Tensor, return_dual: bool = False):
         """Public API. Assumes zero incoming severity if used as a standalone layer."""
-        d = torch.zeros_like(x)
-        x_out, d_out = self.forward_internal(x, d)
-        return (x_out, d_out) if return_dual else x_out
+        dual = torch.zeros_like(x)
+        x_out, dual_out, damage_out = self.forward_internal(x, dual)
+        return (x_out, dual_out, damage_out) if return_dual else x_out
 
 
 class KAN(torch.nn.Module):
@@ -174,7 +220,8 @@ class KAN(torch.nn.Module):
         grid_size: Number of inner intervals partitioning the spline domain
         spline_order: Polynomial degree of the local B-spline bases.
         base_activation: Activation function applied exclusively to the linear track. Change with caution - see README!
-        grid_range: Physical bounds `(lower, upper)` defining the spline evaluation domain.
+        grid_range: Physical bounds `(lower, upper)` defining the spline evaluation domain. Can be a list-of-tuples or a Tensor,
+            for per-feature ranges.
         pure_spline_mode: If True, completely disables the linear track across all child layers, forcing hard
             saturation/clipping at boundaries instead of proportional linear extrapolation.
         spline_dropout: Dropout probability, to encourage asymptote learning.
@@ -188,11 +235,12 @@ class KAN(torch.nn.Module):
         grid_size: int = 5,
         spline_order: int = 3,
         base_activation: torch.nn.Module = torch.nn.Identity,
-        grid_range: tuple[float, float] = (-1.0, 1.0),
+        grid_range: tuple[float, float] | list[tuple[float, float]] | torch.Tensor = (-1.0, 1.0),
         pure_spline_mode: bool = False,
         spline_dropout: float = 0.0,
         interaction_map: list[list[int]] = [],
         symbolic_order: int = 0,
+        transition_overlap: float = 0.0,
     ):
         super().__init__()
         self.interactor = KANInteraction(interaction_map, grid_range)
@@ -201,7 +249,7 @@ class KAN(torch.nn.Module):
         eff_layer_dims[0] += len(interaction_map)
 
         self.layers = torch.nn.ModuleList()
-        for in_features, out_features in zip(eff_layer_dims, eff_layer_dims[1:]):
+        for i, (in_features, out_features) in enumerate(zip(eff_layer_dims, eff_layer_dims[1:])):
             self.layers.append(
                 KANLinear(
                     in_features,
@@ -209,10 +257,12 @@ class KAN(torch.nn.Module):
                     grid_size=grid_size,
                     spline_order=spline_order,
                     base_activation=base_activation,
-                    grid_range=grid_range,
+                    grid_range=grid_range if i == 0 else (-1.0, 1.0),
                     spline_dropout=spline_dropout,
                     pure_spline_mode=pure_spline_mode,
+                    transition_overlap=transition_overlap,
                     _quiet_init=symbolic_order > 0,
+                    _is_hidden_layer=bool(i > 0),
                 )
             )
 
@@ -223,19 +273,57 @@ class KAN(torch.nn.Module):
                 in_features=eff_layer_dims[0], out_features=eff_layer_dims[-1], order=symbolic_order
             )
 
+    def get_stiffness_loss(self, n=1, lambda_l1=1e-4, lambda_l2=1e-5):
+        """
+        Computes the 1st-order Elastic Net (L1 + L2) stiffness penalty for all layers,
+        scaled by their physical knot step size (h) to maintain invariance across grid sizes.
+        """
+        return sum(layer.get_stiffness_loss(n=n, lambda_l1=lambda_l1, lambda_l2=lambda_l2) for layer in self.layers)
+
+    @cached_property
+    def _sobol(self):
+        return SobolEngine(dimension=self.layer_dims[0], scramble=True)
+
+    def get_sobolev_loss(self, lambda_l1=1e-4, lambda_l2=1e-5, num_probes: int | None = None):
+        """
+        Computes a Sobolev H1 smoothing penalty across a dense, low-discrepancy Sobol grid.
+        Forces the macroscopic physical extrapolation to remain smooth, regardless of internal weights.
+        """
+        N_feats = self.layer_dims[0]
+        if num_probes is None:
+            # Estimate required depth based on pairwise interaction scaling (D^2)
+            needed_bits = (N_feats ** 2 * self.grid_size).bit_length() + 1
+            N_probes = 1 << max(5, needed_bits)
+        epsilon = 1e-3
+        lower, upper = self.layers[0].grid_bounds.T
+        x_probes = lower + self._sobol.draw(N_probes).to(lower.device) * (upper - lower)
+        x_perturbed = x_probes.unsqueeze(1) + epsilon * torch.eye(N_feats, device=lower.device).unsqueeze(0)
+        x_mega = torch.cat([x_probes, x_perturbed.view(-1, N_feats)], dim=0)
+        y_mega = self.forward(x_mega)
+        y_base = y_mega[:N_probes]
+        y_pert = y_mega[N_probes:].view(N_probes, N_feats)
+        gradients = (y_pert - y_base) / epsilon
+        return lambda_l1 * gradients.abs().mean() + lambda_l2 * gradients.pow(2).mean()
+
+    def get_deep_loss(self, lambda_l1=1e-4, lambda_l2=1e-5):
+        loss = 0.0
+        for layer in self.layers[1:]:
+            loss += lambda_l1 * layer.base_weight.abs().mean() + lambda_l2 * layer.base_weight.pow(2).mean()
+        return loss
+
     def extra_repr(self) -> str:
         # Most information is already in the layers, just add the pre-interactions dim
         return f"in_features={self.layer_dims[0]}"
+
+    def reset_parameters(self):
+        for layer in self.layers:
+            layer.reset_parameters()
 
     def forward(
         self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor], return_dual: bool = False
     ):
         if isinstance(x, tuple):
-            if self.interactor.interaction_map:
-                raise ValueError(
-                    "Both explicit and implicit interactions supplied. This is not supported."
-                )
-            x, d = x
+            x, dual = x
             if x.shape[1] != self.layers[0].in_features:
                 raise ValueError(
                     f"Wrong input dimension {x.shape[1]}, expected {self.layers[0].in_features}"
@@ -245,16 +333,19 @@ class KAN(torch.nn.Module):
                 raise ValueError(
                     f"Wrong input dimension {x.shape[1]}, expected {self.layer_dims[0]}"
                 )
-            x, d = self.interactor(x)
+            x, dual = self.interactor(x)
+        damages = [dual]
 
         if self.symbolic_order > 0:
-            poly_out, poly_dual = self.poly_skip(x, d)
+            poly_out, poly_dual = self.poly_skip(x, dual)
 
         # Route features along with dual through the layers
         for layer in self.layers:
-            x, d = layer.forward_internal(x, d)
+            x, dual, local_damage = layer.forward_internal(x, dual)
+            if local_damage is not None:
+                damages.append(local_damage)
         if self.symbolic_order > 0:
             x = x + poly_out
-            d = d + poly_dual
+            dual = dual + poly_dual
 
-        return (x, d) if return_dual else x
+        return (x, dual, damages) if return_dual else x

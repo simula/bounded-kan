@@ -63,6 +63,11 @@ class PolynomialSkip(nn.Module):
             combos = itertools.combinations_with_replacement(range(in_features), d)
             self.combinations.extend(list(combos))
 
+        feature_degrees = [len(c) for c in self.combinations]
+        degrees_tensor = torch.tensor(feature_degrees, dtype=torch.float32)
+        degree_penalty = 2.0 + 2.0 * degrees_tensor
+        self.register_buffer("degree_penalty", degree_penalty.unsqueeze(0))
+
         num_features = len(self.combinations)
 
         # 2. The standard linear weights
@@ -101,7 +106,7 @@ class PolynomialSkip(nn.Module):
         P_x = torch.cat(poly_features, dim=1)
 
         # --- B. Apply the -5.0 Sigmoid Gate ---
-        active_weights = self.weights * torch.sigmoid(self.gates - 5.0)
+        active_weights = self.weights * torch.sigmoid(self.gates - self.degree_penalty)
 
         # --- C. Route the Physical Prediction ---
         out = F.linear(P_x, active_weights)
@@ -114,3 +119,23 @@ class PolynomialSkip(nn.Module):
             return out, out_dual
 
         return out
+
+
+class LearnedPower(nn.Module):
+    def __init__(self, bounds: tuple[float, float], init_val=None):
+        super().__init__()
+        self.min_val, self.max_val = bounds
+        if init_power is None:
+            init_power = (self.min_val + self.max_val) / 2.0
+
+        init_logit = math.log((init_power - self.min_val) / (self.max_val - init_power))
+        self.raw_alpha = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
+
+    def get_order(self):
+        return self.min_val + (self.max_val - self.min_val) * torch.sigmoid(self.raw_alpha)
+
+    def forward(self, x):
+        alpha = self.get_order()
+        # Epsilon prevents NaN gradients from the derivative of the exponent: x^a * ln(x)
+        safe_x = torch.abs(x) + 1e-6
+        return torch.sign(x) * (safe_x ** alpha)
