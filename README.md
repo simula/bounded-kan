@@ -13,15 +13,12 @@ It also uses forward uncertainty propagation with interval arithmetic to track t
 
 PhysKAN is built on three central ideas, meant to bridge the gap between theoretical non-linear mapping and the fail-safes required for physical engineering:
 
-1. **Progressive Koopman-style unbending:** Rather than relying on black-box MLP node activations, the model acts as a structural filter.
-It uses constrained B-splines to progressively unbend non-linear physical inputs layer-by-layer, lifting them into a linearized latent space.
+1. **Koopman-style unbending:** Rather than relying on black-box MLP node activations, the model acts as a structural filter.
+It uses constrained B-splines to unbend the non-linear physical inputs, lifting them into a linearized latent space.
 
 2. **Embrace out-of-bounds (OOB) values:** Real-world physics do not stay neatly within standardized grids.
 Instead of arbitrarily squashing long-tail events or sensor glitches with clamps or global activations, the architecture uses the grid range to explicitly define the boundary between the dense, well-modeled operational regime and the sparse tail.
 OOB states are clamped on the non-linear spline track and routed unclamped through a parallel linear track, ensuring stable extrapolation.
-
-3. **Epistemic uncertainty tracking:** The network computes a continuous dual property alongside the physical prediction.
-This signal forward-propagates the mathematical severity of any out-of-bounds state, providing a deterministic measure of when the network is forced to extrapolate.
 
 ## Under the hood: the out-of-bounds routing mechanism
 
@@ -68,7 +65,6 @@ For this reason, activations are disabled by default.
 When deploying multi-output configurations, using deep hidden layers can introduce cancellation entanglement.
 The network may fit a zero-impact relationship by balancing opposing weights across internal nodes rather than setting the weights to zero.
 While the physical output remains correct within nominal ranges, this hidden entanglement is unstable out-of-bounds.
-The absolute-weighted path of the dual severity tracker exposes this state by signaling high severity even if the physical prediction appears unaffected.
 To achieve decoupled causal isolation between targets, a shallow architecture with no hidden layers should be used.
 
 ## Feature engineering and explicit interactions
@@ -83,13 +79,6 @@ If a large wave anomaly interacts with a nominal-range cosine feature, their pro
 To prevent this suppression, PhysKAN provides two orthogonal paths to define interactions internally.
 For known asymptotic behaviors, the preferred method is passing an explicit `interaction_map` to the constructor.
 For unknown interactions, setting `symbolic_order` greater than zero allows the network to automatically set up an internal polynomial expansion directly from the raw inputs.
-The network computes a continuous dual property alongside the standard physical prediction.
-This dual represents the mathematical severity of the out-of-bounds state.
-The physical prediction is computed using the non-linear splines and the linear tracks.
-The dual severity bypasses the splines and propagates via the absolute values of the linear weights, ensuring that uncertainties compound.
-By defining interactions internally, the model applies the uncertainty product rule to the input features before they enter the network layers.
-This deterministic distress signal persists through the entire depth of the network.
-It ensures that the non-linear splines are firewalled from learning from the anomaly, while the linear track handles the extrapolated magnitude.
 
 ### Defining the nominal range: data density vs. physical limits
 
@@ -110,8 +99,7 @@ pip install physkan
 
 ## Usage example
 
-The model handles dual interval arithmetic and OOB routing internally.
-A minimal shallow setup is recommended to start, as it provides direct mapping without hidden entanglement.
+A shallow setup is strongly recommended, as it provides direct mapping without hidden entanglement.
 
 ```python
 import torch
@@ -134,11 +122,11 @@ criterion = nn.MSELoss()
 x_nominal = torch.tensor([[0.5, 0.1]])
 
 # Pass data through the model
-prediction, severity_signal, _ = model(x_nominal, return_dual=True)
+prediction, severity_signal, _ = model(x_nominal, return_damage=True)
 
 # For an out-of-bounds event
 x_oob = torch.tensor([[4.0, 0.1]])
-prediction_oob, severity_oob, _ = model(x_oob, return_dual=True)
+prediction_oob, severity_oob, _ = model(x_oob, return_damage=True)
 
 # Severity greater than zero indicates the prediction relies on extrapolated values.
 if severity_oob.max() > 0.0:

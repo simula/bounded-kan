@@ -2,6 +2,7 @@ import copy
 import inspect
 import math
 from functools import cached_property
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -49,7 +50,7 @@ class KANLinear(torch.nn.Module):
         if not isinstance(grid_range, torch.Tensor):
             grid_range = torch.tensor(grid_range, dtype=torch.float32)
         else:
-            grid_range = grid_range.float().clone()
+            grid_range = grid_range.float()
         if grid_range.dim() == 1 and grid_range.size(0) == 2:
             _bounds = grid_range.unsqueeze(0)  # Shape: (1, 2)
         elif grid_range.dim() == 2 and grid_range.size() == (in_features, 2):
@@ -81,10 +82,10 @@ class KANLinear(torch.nn.Module):
         strict_fraction = 0.5  # width of trust region at full quarantine
         crumple_zone = self.spline_order * self.h
         cushion = transition_overlap * (crumple_zone - 1e-6)
-        self.register_buffer("bounds_cushion", torch.cat([-cushion, cushion]))
-        trust_scale = crumple_zone / math.sqrt(-math.log(detach_threshold))
+        self.register_buffer("bounds_cushion", torch.cat([-cushion, cushion]).view(2, -1))
+        trust_sigma = crumple_zone / (upper - lower) / math.sqrt(-math.log(detach_threshold))
         trust_padding = transition_overlap * loose_fraction + (1.0 - transition_overlap) * strict_fraction
-        self.register_buffer("trust_scale", trust_scale * trust_padding)
+        self.register_buffer("eff_trust_sigma", trust_sigma * trust_padding)
 
         self.reset_parameters(_quiet_init)
         self.is_hidden_layer = _is_hidden_layer
@@ -153,28 +154,28 @@ class KANLinear(torch.nn.Module):
             penalty += lambda_l2 * slope.pow(2).mean()
         return penalty
 
-    def forward_internal(self, x: torch.Tensor, d: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_damage: bool = False):
         """Internal forward pass computing both primal (physics) and dual (severity)."""
         assert x.size(-1) == self.in_features
         original_shape = x.shape
         x = x.reshape(-1, self.in_features)
-        d = d.reshape(-1, self.in_features)
 
-        # 1. Linear track (primal and dual)
         if self.pure_spline_mode:
             base_output = 0.0
         else:
             effective_weight = self.base_weight + (1.0 / self.in_features)
             base_output = F.linear(self.base_activation(x), effective_weight)
-        # Dual severity propagates purely through absolute weights
-        lower_bound, upper_bound = self.grid_bounds.T
-        total_importance = effective_weight.abs() + self.spline_weight.abs().amax(dim=2)
-        if self.is_hidden_layer:
-            local_damage = F.relu(x - upper_bound) + F.relu(lower_bound - x)
-            d = d + local_damage
-        else:
-            local_damage = None
-        dual_output = F.linear(d, total_importance)
+
+        # 1. Calculate OOB-ness and resulting trust (if required)
+        trust = local_damage = None
+        if return_damage or (torch.is_grad_enabled() and self.spline_weight.requires_grad):
+            lower_bound, upper_bound = self.grid_bounds.T
+            local_damage = (F.relu(x - upper_bound) + F.relu(lower_bound - x)) / (upper_bound - lower_bound)
+            if local_damage.amax() > 1e-6:
+                if self.is_hidden_layer:
+                    ld = local_damage
+                    local_damage = local_damage.amax(dim=-1, keepdim=True)
+                trust = torch.exp(-((local_damage.detach() / self.eff_trust_sigma.T) ** 2))
 
         # 2. Spline track (*clamped* primal only)
         lower_bound_ex, upper_bound_ex = self.grid_bounds.T + self.bounds_cushion
@@ -184,27 +185,30 @@ class KANLinear(torch.nn.Module):
         if torch.jit.is_tracing() or (x.amin(dim=0) < lower_bound_ex).any() or (x.amax(dim=0) > upper_bound_ex).any():
             x = x.clamp(min=lower_bound_ex, max=upper_bound_ex)
 
-        spline_output = F.linear(
-            self.b_splines(x).view(x.size(0), -1),
-            self.spline_weight.view(self.out_features, -1),
-        )
+        bases = self.b_splines(x)
+        if trust is None or self.is_hidden_layer:
+            # Fast path - hidden layer, or no detachment necessary
+            spline_output = F.linear(
+                bases.view(x.size(0), -1),
+                self.spline_weight.view(self.out_features, -1),
+            )
+            if trust is not None:
+                spline_output = trust * spline_output + (1.0 - trust) * spline_output.detach()
+        elif trust is not None:
+            # Slow path - input layer with gradients enabled AND there is local damage
+            trust = trust.unsqueeze(1)
+            unsummed_splines = torch.einsum('bik,oik->boi', bases, self.spline_weight)
+            unsummed_splines = trust * unsummed_splines + (1.0 - trust) * unsummed_splines.detach()
+            spline_output = unsummed_splines.sum(dim=2)
+
         if self.spline_dropout > 0.0:
             spline_output = F.dropout(spline_output, p=self.spline_dropout, training=self.training)
 
-        if torch.is_grad_enabled() and dual_output.max() > 1e-6:
-            trust = torch.exp(-((dual_output.detach() / self.trust_scale) ** 2))
-            spline_output = trust * spline_output + (1.0 - trust) * spline_output.detach()
-
         # 3. Combine and return tuple
         x_final = (base_output + spline_output).reshape(*original_shape[:-1], self.out_features)
-        d_final = dual_output.reshape(*original_shape[:-1], self.out_features)
-        return x_final, d_final, local_damage
-
-    def forward(self, x: torch.Tensor, return_dual: bool = False):
-        """Public API. Assumes zero incoming severity if used as a standalone layer."""
-        dual = torch.zeros_like(x)
-        x_out, dual_out, damage_out = self.forward_internal(x, dual)
-        return (x_out, dual_out, damage_out) if return_dual else x_out
+        if not return_damage:
+            return x_final
+        return x_final, local_damage
 
 
 class KAN(torch.nn.Module):
@@ -225,7 +229,7 @@ class KAN(torch.nn.Module):
         pure_spline_mode: If True, completely disables the linear track across all child layers, forcing hard
             saturation/clipping at boundaries instead of proportional linear extrapolation.
         spline_dropout: Dropout probability, to encourage asymptote learning.
-        interaction_map: Multiplicative feature interaction indices. Use to define explicit cross-terms while preserving
+        interaction_map: Multiplicative feature interaction indices, or lambdas. Use to define explicit cross-terms while preserving
             strict OOB propagation.
     """
 
@@ -238,15 +242,27 @@ class KAN(torch.nn.Module):
         grid_range: tuple[float, float] | list[tuple[float, float]] | torch.Tensor = (-1.0, 1.0),
         pure_spline_mode: bool = False,
         spline_dropout: float = 0.0,
-        interaction_map: list[list[int]] = [],
+        interaction_map: list[list[int] | Callable[[torch.Tensor], torch.Tensor]] = [],
         symbolic_order: int = 0,
         transition_overlap: float = 0.0,
     ):
         super().__init__()
-        self.interactor = KANInteraction(interaction_map, grid_range)
+        self.interactor = KANInteraction(interaction_map)
         self.layer_dims = layer_dims
+        with torch.no_grad():
+            synth = torch.ones(0, layer_dims[0], dtype=torch.float32)
+            synth_out = self.interactor(synth)
         eff_layer_dims = list(layer_dims)
-        eff_layer_dims[0] += len(interaction_map)
+        eff_layer_dims[0] = synth_out.size(1)
+        with torch.no_grad():
+            # Standardize grid_range into a broadcastable tensor
+            if not isinstance(grid_range, torch.Tensor):
+                grid_range = torch.tensor(grid_range, dtype=torch.float32)
+            else:
+                grid_range = grid_range.float()
+            if grid_range.dim() == 1 and grid_range.size(0) == 2:
+                grid_range = grid_range.expand(layer_dims[0], 2)
+            grid_range = self.interactor.bounds(grid_range, expected_complexity=grid_size)
 
         self.layers = torch.nn.ModuleList()
         for i, (in_features, out_features) in enumerate(zip(eff_layer_dims, eff_layer_dims[1:])):
@@ -320,32 +336,18 @@ class KAN(torch.nn.Module):
             layer.reset_parameters()
 
     def forward(
-        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor], return_dual: bool = False
+        self, x: torch.Tensor, return_damage: bool = False
     ):
-        if isinstance(x, tuple):
-            x, dual = x
-            if x.shape[1] != self.layers[0].in_features:
-                raise ValueError(
-                    f"Wrong input dimension {x.shape[1]}, expected {self.layers[0].in_features}"
-                )
-        else:
-            if x.shape[1] != self.layer_dims[0]:
-                raise ValueError(
-                    f"Wrong input dimension {x.shape[1]}, expected {self.layer_dims[0]}"
-                )
-            x, dual = self.interactor(x)
-        damages = [dual]
+        x = self.interactor(x)
+        damages = []
 
         if self.symbolic_order > 0:
-            poly_out, poly_dual = self.poly_skip(x, dual)
+            poly_out = self.poly_skip(x)
 
-        # Route features along with dual through the layers
         for layer in self.layers:
-            x, dual, local_damage = layer.forward_internal(x, dual)
-            if local_damage is not None:
-                damages.append(local_damage)
+            x, local_damage = layer.forward(x, return_damage=True)
+            damages.append(local_damage)
         if self.symbolic_order > 0:
             x = x + poly_out
-            dual = dual + poly_dual
 
-        return (x, dual, damages) if return_dual else x
+        return (x, damages) if return_damage else x
